@@ -21,10 +21,14 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+void ds4_gpu_set_device(int device_id);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_device(uint64_t bytes, int device_id);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_device(uint64_t bytes, int device_id);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
+int ds4_gpu_tensor_copy_p2p(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);

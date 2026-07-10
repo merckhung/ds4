@@ -43,6 +43,7 @@ struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
+    int device_id; // Added for multi-GPU
 };
 
 typedef struct {
@@ -88,8 +89,28 @@ static int g_model_cache_full;
 static int g_model_mapping_failure_notice_printed;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
-static cublasHandle_t g_cublas;
-static int g_cublas_ready;
+#define DS4_MAX_GPUS 8
+static cublasHandle_t g_cublas_array[DS4_MAX_GPUS];
+static int g_cublas_ready_array[DS4_MAX_GPUS];
+static cudaStream_t g_streams[DS4_MAX_GPUS];
+static int g_device_count = 0;
+
+static cublasHandle_t get_cublas_handle(void) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return NULL;
+    if (dev < 0 || dev >= DS4_MAX_GPUS) return NULL;
+    return g_cublas_array[dev];
+}
+static int is_cublas_ready(void) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    if (dev < 0 || dev >= DS4_MAX_GPUS) return 0;
+    return g_cublas_ready_array[dev];
+}
+
+#define g_cublas (get_cublas_handle())
+#define g_cublas_ready (is_cublas_ready())
+
 static int g_quality_mode;
 static int g_ssd_streaming_mode;
 
@@ -209,8 +230,9 @@ static uint64_t g_model_load_progress_last_cgib = UINT64_MAX;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
-static void *g_cuda_tmp;
-static uint64_t g_cuda_tmp_bytes;
+#define DS4_CUDA_TMP_MAX_DEVICES 8
+static void *g_cuda_tmp[DS4_CUDA_TMP_MAX_DEVICES];
+static uint64_t g_cuda_tmp_bytes[DS4_CUDA_TMP_MAX_DEVICES];
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -253,11 +275,16 @@ __global__ static void dequant_q8_0_to_f32_kernel(
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
-    if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
+    /* Scratch must live on the device whose kernels use it; a single shared
+     * buffer forces the other GPU into uncached peer reads on every matmul. */
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= DS4_CUDA_TMP_MAX_DEVICES) dev = 0;
+    if (g_cuda_tmp_bytes[dev] >= bytes) return g_cuda_tmp[dev];
+    if (g_cuda_tmp[dev]) {
+        (void)cudaFree(g_cuda_tmp[dev]);
+        g_cuda_tmp[dev] = NULL;
+        g_cuda_tmp_bytes[dev] = 0;
     }
     void *ptr = NULL;
     cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
@@ -267,9 +294,9 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
         (void)cudaGetLastError();
         return NULL;
     }
-    g_cuda_tmp = ptr;
-    g_cuda_tmp_bytes = bytes;
-    return g_cuda_tmp;
+    g_cuda_tmp[dev] = ptr;
+    g_cuda_tmp_bytes[dev] = bytes;
+    return g_cuda_tmp[dev];
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -2252,33 +2279,80 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+extern "C" void ds4_gpu_set_device(int device_id) {
+    (void)cudaSetDevice(device_id);
+}
+
 extern "C" int ds4_gpu_init(void) {
-    int dev = 0;
-    if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
-    cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
-                prop.name, prop.major, prop.minor);
+    if (cudaGetDeviceCount(&g_device_count) != cudaSuccess) {
+        g_device_count = 1;
     }
-    if (!g_cublas_ready) {
-        if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
-        const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(g_cublas, math_mode);
-        g_cublas_ready = 1;
+    if (g_device_count > DS4_MAX_GPUS) g_device_count = DS4_MAX_GPUS;
+
+    // Enable P2P if we have multiple GPUs
+    if (g_device_count > 1) {
+        for (int i = 0; i < g_device_count; i++) {
+            cudaSetDevice(i);
+            for (int j = 0; j < g_device_count; j++) {
+                if (i != j) {
+                    int can_access = 0;
+                    if (cudaDeviceCanAccessPeer(&can_access, i, j) == cudaSuccess && can_access) {
+                        (void)cudaDeviceEnablePeerAccess(j, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    // Initialize cuBLAS and streams for all devices
+    for (int i = 0; i < g_device_count; i++) {
+        cudaSetDevice(i);
+        if (!g_cublas_ready_array[i]) {
+            if (cublasCreate(&g_cublas_array[i]) != CUBLAS_STATUS_SUCCESS) {
+                fprintf(stderr, "ds4: failed to create cuBLAS handle for device %d\n", i);
+                return 0;
+            }
+            const cublasMath_t math_mode =
+                (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+                    ? CUBLAS_DEFAULT_MATH
+                    : CUBLAS_TF32_TENSOR_OP_MATH;
+            (void)cublasSetMathMode(g_cublas_array[i], math_mode);
+            g_cublas_ready_array[i] = 1;
+        }
+        if (!g_streams[i]) {
+            if (cudaStreamCreate(&g_streams[i]) != cudaSuccess) {
+                fprintf(stderr, "ds4: failed to create stream for device %d\n", i);
+                return 0;
+            }
+        }
+    }
+
+    // Set default device back to 0
+    cudaSetDevice(0);
+
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d), %d GPUs detected\n",
+                prop.name, prop.major, prop.minor, g_device_count);
     }
     return 1;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
-    (void)cudaDeviceSynchronize();
-    if (g_cublas_ready) {
-        (void)cublasDestroy(g_cublas);
-        g_cublas_ready = 0;
-        g_cublas = NULL;
+    int prev_device = 0;
+    cudaGetDevice(&prev_device);
+    for (int i = 0; i < g_device_count; i++) {
+        cudaSetDevice(i);
+        if (g_cublas_ready_array[i]) {
+            (void)cublasDestroy(g_cublas_array[i]);
+            g_cublas_ready_array[i] = 0;
+        }
+        if (g_streams[i]) {
+            (void)cudaStreamDestroy(g_streams[i]);
+            g_streams[i] = NULL;
+        }
     }
+    cudaSetDevice(prev_device);
     cuda_stream_selected_cache_release();
     cuda_stream_expert_cache_release_all();
     cuda_stream_selected_stage_release();
@@ -2293,10 +2367,12 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_q8_f32_ranges.clear();
     g_q8_f32_by_offset.clear();
     g_q8_f32_bytes = 0;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
+    for (int d = 0; d < DS4_CUDA_TMP_MAX_DEVICES; d++) {
+        if (g_cuda_tmp[d]) {
+            (void)cudaFree(g_cuda_tmp[d]);
+            g_cuda_tmp[d] = NULL;
+            g_cuda_tmp_bytes[d] = 0;
+        }
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
@@ -2346,15 +2422,28 @@ extern "C" void ds4_gpu_cleanup(void) {
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+    return ds4_gpu_tensor_alloc_device(bytes, 0);
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_device(uint64_t bytes, int device_id) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
+    
+    int prev_device = 0;
+    cudaGetDevice(&prev_device);
+    cudaSetDevice(device_id);
+    
     if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
+        cudaSetDevice(prev_device);
         free(t);
         return NULL;
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->device_id = device_id;
+    
+    cudaSetDevice(prev_device);
     return t;
 }
 
@@ -2362,12 +2451,44 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
+    int prev_device = 0;
+    cudaGetDevice(&prev_device);
     if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc")) {
         free(t);
         return NULL;
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->device_id = prev_device;
+    return t;
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_device(uint64_t bytes, int device_id) {
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_managed(bytes);
+    if (!t) return NULL;
+    if (device_id >= 0 && device_id < g_device_count) {
+        /* Pin the pages' home to the owning device so demand paging settles
+         * there instead of thrashing across PCIe, while every other device
+         * keeps a mapping for peer reads. */
+#if CUDART_VERSION >= 13000
+        cudaMemLocation loc;
+        loc.type = cudaMemLocationTypeDevice;
+        loc.id = device_id;
+        (void)cudaMemAdvise(t->ptr, (size_t)t->bytes, cudaMemAdviseSetPreferredLocation, loc);
+        for (int d = 0; d < g_device_count; d++) {
+            cudaMemLocation dloc;
+            dloc.type = cudaMemLocationTypeDevice;
+            dloc.id = d;
+            (void)cudaMemAdvise(t->ptr, (size_t)t->bytes, cudaMemAdviseSetAccessedBy, dloc);
+        }
+#else
+        (void)cudaMemAdvise(t->ptr, (size_t)t->bytes, cudaMemAdviseSetPreferredLocation, device_id);
+        for (int d = 0; d < g_device_count; d++) {
+            (void)cudaMemAdvise(t->ptr, (size_t)t->bytes, cudaMemAdviseSetAccessedBy, d);
+        }
+#endif
+        t->device_id = device_id;
+    }
     return t;
 }
 
@@ -2382,6 +2503,13 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
+
+    /* DS4_CUDA_KV_CACHE_MODE=device|managed overrides the heuristic. */
+    const char *mode = getenv("DS4_CUDA_KV_CACHE_MODE");
+    if (mode) {
+        if (strcmp(mode, "device") == 0) return 0;
+        if (strcmp(mode, "managed") == 0) return 1;
+    }
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
      * unified-memory machine unresponsive.  Managed memory restores the old
@@ -2414,12 +2542,19 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
+    t->device_id = base->device_id;
     return t;
 }
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner && tensor->ptr) {
+        int prev_device = 0;
+        cudaGetDevice(&prev_device);
+        cudaSetDevice(tensor->device_id);
+        (void)cudaFree(tensor->ptr);
+        cudaSetDevice(prev_device);
+    }
     free(tensor);
 }
 
@@ -2476,6 +2611,24 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+extern "C" int ds4_gpu_tensor_copy_p2p(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src) {
+    if (!dst || !src) return 0;
+    if (dst->bytes < src->bytes) return 0;
+    
+    if (dst->device_id == src->device_id) {
+        return ds4_gpu_tensor_copy(dst, 0, src, 0, src->bytes);
+    }
+    
+    cudaStream_t stream = g_streams[dst->device_id];
+    cudaError_t err = cudaMemcpyPeerAsync(dst->ptr, dst->device_id,
+                                          src->ptr, src->device_id,
+                                          src->bytes, stream);
+    if (err != cudaSuccess) return 0;
+    /* Consumers launch on the destination device's default stream, which has
+     * no ordering against g_streams[dst]; block until the copy lands. */
+    return cuda_ok(cudaStreamSynchronize(stream), "p2p copy sync");
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
@@ -2497,7 +2650,17 @@ extern "C" int ds4_gpu_end_commands(void) {
 }
 extern "C" int ds4_gpu_synchronize(void) {
     cuda_model_load_progress_finish();
-    return cuda_ok(cudaDeviceSynchronize(), "synchronize");
+    int prev_device = 0;
+    cudaGetDevice(&prev_device);
+    int ok = 1;
+    for (int i = 0; i < g_device_count; i++) {
+        cudaSetDevice(i);
+        if (!cuda_ok(cudaDeviceSynchronize(), "synchronize")) {
+            ok = 0;
+        }
+    }
+    cudaSetDevice(prev_device);
+    return ok;
 }
 
 static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {

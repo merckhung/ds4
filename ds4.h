@@ -117,6 +117,8 @@ typedef struct {
     uint32_t load_layer_start;
     uint32_t load_layer_end;
     bool load_output;
+    int gpu_split_layer;
+    bool tensor_parallel;
     ds4_distributed_options distributed;
 } ds4_engine_options;
 

@@ -4444,9 +4444,203 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+/* The identifier immediately after a DSML marker must be one of tool_calls /
+ * invoke / parameter. The quantized model mangles it in several ways: stutter
+ * ("invinvoke", "tooltool_calls", "toolinvoke") and truncation/misspelling
+ * ("toolcall" for tool_calls). Classify the token by the keyword it most
+ * resembles rather than trying to enumerate every corruption. */
+static const char *dsml_canonical_keyword(const char *id, size_t len) {
+    if (len == 0) return NULL;
+    /* Full-keyword substring first so a stutter like "toolinvoke" resolves to
+     * invoke (contains "invoke"), not tool_calls. */
+    if (memmem(id, len, "invoke", 6)) return "invoke";
+    if (memmem(id, len, "parameter", 9)) return "parameter";
+    if (memmem(id, len, "tool_calls", 10)) return "tool_calls";
+    /* Then distinctive prefixes, so truncations ("inv", "par") and merges
+     * ("invname", "parametername") still classify. */
+    if (len >= 3 && memcmp(id, "inv", 3) == 0) return "invoke";
+    if (len >= 3 && memcmp(id, "par", 3) == 0) return "parameter";
+    if (len >= 4 && memcmp(id, "tool", 4) == 0) return "tool_calls";
+    if (len >= 4 && memcmp(id, "call", 4) == 0) return "tool_calls";
+    return NULL;
+}
+
+/* If a canonical keyword was mangled together with its attribute (no space,
+ * e.g. "invname" / "parametername"), return the trailing attribute name so the
+ * caller can re-insert the separator. */
+static const char *dsml_runin_attribute(const char *id, size_t len) {
+    static const char *attrs[] = { "string", "name" };
+    for (size_t a = 0; a < sizeof(attrs) / sizeof(attrs[0]); a++) {
+        const size_t al = strlen(attrs[a]);
+        if (len > al && memcmp(id + len - al, attrs[a], al) == 0) return attrs[a];
+    }
+    return NULL;
+}
+
+/* On a parse failure, canonicalize the DSML tags the quantized model mangles
+ * and let the normal parser retry. Handles three corruption classes around
+ * each "｜DSML｜" core marker:
+ *   - delimiter junk: "</</｜DSML｜invoke>"  -> "</｜DSML｜invoke>"
+ *   - mangled keyword: "toolcall"/"invinvoke" -> tool_calls/invoke
+ *   - keyword+attribute merge: "invname"/"parametername" -> "invoke name" etc.
+ * Returns a new string if anything changed, else NULL. */
+static char *dsml_normalize_keywords(const char *text) {
+    if (!text) return NULL;
+    const size_t n = strlen(text);
+    const char *core = DS4_DSML;             /* "｜DSML｜" */
+    const char *core_short = DS4_DSML_SHORT;  /* "DSML｜"  */
+    const size_t clen = strlen(core);
+    const size_t cslen = strlen(core_short);
+    buf out = {0};
+    bool changed = false;
+    size_t i = 0;
+    while (i < n) {
+        /* A DSML tag is a run of '<' and '/' delimiter bytes followed by the
+         * core marker. Anything else is copied through verbatim. */
+        if (text[i] == '<') {
+            size_t d = i;
+            while (d < n && (text[d] == '<' || text[d] == '/')) d++;
+            const char *marker = NULL;
+            size_t mlen = 0;
+            if (d + clen <= n && memcmp(text + d, core, clen) == 0) {
+                marker = core; mlen = clen;
+            } else if (d + cslen <= n && memcmp(text + d, core_short, cslen) == 0) {
+                marker = core_short; mlen = cslen;
+            }
+            if (marker) {
+                bool has_slash = false;
+                for (size_t k = i; k < d; k++) if (text[k] == '/') { has_slash = true; break; }
+                const char *delim = has_slash ? "</" : "<";
+                if ((size_t)(d - i) != strlen(delim) ||
+                    memcmp(text + i, delim, d - i) != 0) {
+                    changed = true; /* collapsed delimiter junk */
+                }
+                buf_puts(&out, delim);
+                buf_append(&out, marker, mlen);
+                size_t p = d + mlen;
+                size_t j = p;
+                while (j < n && ((text[j] >= 'a' && text[j] <= 'z') || text[j] == '_')) j++;
+                const size_t idlen = j - p;
+                const char *canon = dsml_canonical_keyword(text + p, idlen);
+                const size_t kwlen = canon ? strlen(canon) : 0;
+                const char *attr = canon ? dsml_runin_attribute(text + p, idlen) : NULL;
+                if (!canon || (idlen == kwlen && memcmp(canon, text + p, idlen) == 0)) {
+                    buf_append(&out, text + p, idlen);
+                } else if (idlen > kwlen && memcmp(canon, text + p, kwlen) == 0) {
+                    /* Full keyword ran together with an attribute, e.g.
+                     * "parametername" -> "parameter name". */
+                    buf_puts(&out, canon);
+                    buf_putc(&out, ' ');
+                    buf_append(&out, text + p + kwlen, idlen - kwlen);
+                    changed = true;
+                } else if (attr) {
+                    /* Truncated keyword merged with its attribute, e.g.
+                     * "invname" -> "invoke name". */
+                    buf_puts(&out, canon);
+                    buf_putc(&out, ' ');
+                    buf_puts(&out, attr);
+                    changed = true;
+                } else {
+                    /* Stutter or misspelling ("toolcall", "invinvoke"). */
+                    buf_puts(&out, canon);
+                    changed = true;
+                }
+                i = j;
+                continue;
+            }
+        }
+        buf_putc(&out, text[i]);
+        i++;
+    }
+    if (!changed) {
+        buf_free(&out);
+        return NULL;
+    }
+    char *result = xstrndup(out.ptr ? out.ptr : "", out.len);
+    buf_free(&out);
+    return result;
+}
+
+static bool parse_generated_message_ex_raw(const char *text, bool require_thinking_closed,
+                                           char **content_out, char **reasoning_out,
+                                           tool_calls *calls);
+static bool try_repair_dsml(const char *s, size_t len, buf *out);
+
+/* Reparse a recovery candidate; if it yields tool calls, adopt it (replacing
+ * the out-params) and return true. Otherwise leave the out-params untouched. */
+static bool dsml_reparse_and_adopt(const char *cand, bool require_thinking_closed,
+                                   char **content_out, char **reasoning_out,
+                                   tool_calls *calls) {
+    if (!cand) return false;
+    char *nc = NULL, *nr = NULL;
+    tool_calls ncalls = {0};
+    bool ok = parse_generated_message_ex_raw(cand, require_thinking_closed,
+                                             &nc, &nr, &ncalls);
+    if (ok && ncalls.len > 0) {
+        free(*content_out); *content_out = nc;
+        free(*reasoning_out); *reasoning_out = nr;
+        tool_calls_free(calls);
+        *calls = ncalls;
+        return true;
+    }
+    free(nc);
+    free(nr);
+    tool_calls_free(&ncalls);
+    return false;
+}
+
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
+    bool raw_ok = parse_generated_message_ex_raw(text, require_thinking_closed,
+                                                 content_out, reasoning_out, calls);
+    /* Salvage only when a DSML marker is present but produced no calls — this
+     * covers a hard parse failure (mangled invoke/parameter), a mangled
+     * tool_calls *open* tag ("toolcall") that made the parser miss the marker,
+     * and truncated blocks missing their closing tags. */
+    const bool has_marker = text && (strstr(text, "<" DS4_DSML) != NULL ||
+                                     strstr(text, "<" DS4_DSML_SHORT) != NULL);
+    if ((raw_ok && calls->len > 0) || !has_marker) {
+        return raw_ok;
+    }
+
+    /* Recovery candidates, tried in order: keyword/delimiter-normalized, then
+     * truncation-repaired (on the normalized text, then the original). */
+    char *norm = dsml_normalize_keywords(text ? text : "");
+    const char *base = norm ? norm : (text ? text : "");
+    bool adopted = false;
+    const char *how = NULL;
+
+    if (norm && dsml_reparse_and_adopt(norm, require_thinking_closed,
+                                       content_out, reasoning_out, calls)) {
+        adopted = true; how = "normalized mangled DSML keyword(s)";
+    }
+    if (!adopted) {
+        buf rep = {0};
+        if (try_repair_dsml(base, strlen(base), &rep) &&
+            dsml_reparse_and_adopt(rep.ptr, require_thinking_closed,
+                                   content_out, reasoning_out, calls)) {
+            adopted = true; how = "repaired truncated DSML block";
+        }
+        buf_free(&rep);
+    }
+    free(norm);
+
+    if (adopted) {
+        fprintf(stderr, "ds4-server: %s; reparsing tool call\n", how);
+        return true;
+    }
+    if (getenv("DS4_DEBUG_DSML_NORM")) {
+        fprintf(stderr,
+                "ds4-server: DSML recovery FAILED (raw_ok=%d)\n  text=<<<%.400s>>>\n",
+                raw_ok, text ? text : "(null)");
+    }
+    return raw_ok;
+}
+
+static bool parse_generated_message_ex_raw(const char *text, bool require_thinking_closed,
+                                           char **content_out, char **reasoning_out,
+                                           tool_calls *calls) {
     text = text ? text : "";
     const char *tool_search = text;
 
@@ -10807,7 +11001,7 @@ decode_again:
                     if (dsml_snippet_len > 500) dsml_snippet_len = 500;
                 }
                 /* Also log a snippet of the full text to see what the model output */
-                size_t text_snippet_len = text.len > 300 ? 300 : text.len;
+                size_t text_snippet_len = text.len > 2000 ? 2000 : text.len;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
                            ctx_span,
@@ -11278,6 +11472,28 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    /* Anthropic token-counting endpoint: parse the same way as /v1/messages
+     * but only report the tokenized prompt length instead of generating.
+     * The Claude CLI calls this for context accounting; a 404 here surfaces
+     * as an API error on the client. */
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages/count_tokens")) {
+        request creq = {0};
+        char cerr[160];
+        const int cctx = ds4_session_ctx(s->session);
+        if (!parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
+                                     cctx, &creq, cerr, sizeof(cerr))) {
+            http_error(fd, s->enable_cors, 400, cerr);
+            http_request_free(&hr);
+            goto done;
+        }
+        char cbody[64];
+        snprintf(cbody, sizeof(cbody), "{\"input_tokens\":%d}\n", creq.prompt.len);
+        http_response(fd, s->enable_cors, 200, "application/json", cbody);
+        request_free(&creq);
+        http_request_free(&hr);
+        goto done;
+    }
+
     request req;
     char err[160];
     bool ok = false;
@@ -11602,6 +11818,10 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--gpu-split-layer")) {
+            c.engine.gpu_split_layer = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--tensor-parallel")) {
+            c.engine.tensor_parallel = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
             uint32_t experts = 0;
             uint64_t bytes = 0;
@@ -13292,6 +13512,91 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
    valid tool calls for all three DSML styles and multiple truncation scenarios.
    Balanced but malformed DSML is not repaired: the model must retry it.
    This tests repair ACCURACY, not just that it doesn't crash. */
+static void test_dsml_normalizes_mangled_keywords(void) {
+    /* Each string mangles the keyword after a marker in a way the quantized
+     * model has produced live; parse_generated_message_ex must normalize and
+     * parse it into a proper tool call. */
+    const char *cases[] = {
+        /* tool_calls -> toolcall (the reported hello-world/bazel failure) */
+        "Let me create the file.\n\n"
+        "<" DS4_DSML "toolcall>"
+        DS4_INVOKE_START " name=\"Write\">"
+        DS4_PARAM_START " name=\"file_path\" string=\"true\">/tmp/BUILD" DS4_PARAM_END
+        DS4_INVOKE_END
+        DS4_TOOL_CALLS_END,
+        /* stutter: tool_calls -> tooltool_calls */
+        "<" DS4_DSML "tooltool_calls>"
+        DS4_INVOKE_START " name=\"Write\">"
+        DS4_PARAM_START " name=\"file_path\" string=\"true\">/tmp/BUILD" DS4_PARAM_END
+        DS4_INVOKE_END
+        DS4_TOOL_CALLS_END,
+        /* stutter: invoke -> invinvoke (open) and invinvoke (close) */
+        DS4_TOOL_CALLS_START
+        "<" DS4_DSML "invinvoke name=\"Write\">"
+        DS4_PARAM_START " name=\"file_path\" string=\"true\">/tmp/BUILD" DS4_PARAM_END
+        "</" DS4_DSML "invinvoke>"
+        DS4_TOOL_CALLS_END,
+        /* keyword ran together with attribute: parametername (missing space) */
+        DS4_TOOL_CALLS_START
+        DS4_INVOKE_START " name=\"Write\">"
+        "<" DS4_DSML "parametername=\"file_path\" string=\"true\">/tmp/BUILD" DS4_PARAM_END
+        DS4_INVOKE_END
+        DS4_TOOL_CALLS_END,
+        /* invoke truncated + merged with attribute: invname="Write" */
+        DS4_TOOL_CALLS_START
+        "<" DS4_DSML "invname=\"Write\">"
+        DS4_PARAM_START " name=\"file_path\" string=\"true\">/tmp/BUILD" DS4_PARAM_END
+        DS4_INVOKE_END
+        DS4_TOOL_CALLS_END,
+        /* stutter prefix on invoke: toolinvoke */
+        DS4_TOOL_CALLS_START
+        "<" DS4_DSML "toolinvoke name=\"Write\">"
+        DS4_PARAM_START " name=\"file_path\" string=\"true\">/tmp/BUILD" DS4_PARAM_END
+        DS4_INVOKE_END
+        DS4_TOOL_CALLS_END,
+        /* exact live-leaked block: invname + newlines + two params, name=Bash */
+        "Let me check.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        "<" DS4_DSML "invname=\"Bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">ls /tmp" DS4_PARAM_END "\n"
+        DS4_PARAM_START " name=\"description\" string=\"true\">List dir" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END,
+        /* doubled close delimiter: </</｜DSML｜invoke> */
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"Write\">\n"
+        DS4_PARAM_START " name=\"file_path\" string=\"true\">/tmp/MODULE.bazel" DS4_PARAM_END "\n"
+        "</" "</" DS4_DSML "invoke>\n"
+        DS4_TOOL_CALLS_END,
+        /* clean markers, but the value is full of '<' and '<<' (C++ source) */
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"Write\">\n"
+        DS4_PARAM_START " name=\"file_path\" string=\"true\">/tmp/hello.cc" DS4_PARAM_END "\n"
+        DS4_PARAM_START " name=\"content\" string=\"true\">#include <iostream>\n\n"
+        "int main() {\n    std::cout << \"Hello, World!\" << std::endl;\n    return 0;\n}\n"
+        DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END,
+        /* Bash command value with a heredoc: '>', '<<', multi-line content */
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"Bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">cd /tmp && cat > MODULE.bazel << 'EOF'\n"
+        "module(\n    name = \"multilang\",\n    version = \"0.1.0\",\n)\nEOF" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END,
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        TEST_ASSERT(parse_generated_message_ex(cases[i], false,
+                                               &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name != NULL);
+        TEST_ASSERT(calls.v[0].arguments && calls.v[0].arguments[0] == '{');
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+}
+
 static void test_dsml_repair_produces_parseable_calls(void) {
     char *content = NULL;
     char *reasoning = NULL;
@@ -15798,6 +16103,7 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();
+    test_dsml_normalizes_mangled_keywords();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();

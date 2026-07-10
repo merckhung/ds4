@@ -6197,6 +6197,10 @@ int ds4_gpu_init(void) {
     return 1;
 }
 
+void ds4_gpu_set_device(int device_id) {
+    (void)device_id;
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
@@ -6238,6 +6242,15 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return ds4_gpu_tensor_alloc(bytes);
+}
+
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_device(uint64_t bytes, int device_id) {
+    (void)device_id;
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
+int ds4_gpu_tensor_copy_p2p(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src) {
+    return ds4_gpu_tensor_copy(dst, 0, src, 0, src->bytes);
 }
 
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
