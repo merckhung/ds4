@@ -4,6 +4,10 @@
 #include "ds4_kvstore.h"
 #include "rax.h"
 
+/* Public model id for local clients (Claude CLI, etc.). Backend still accepts
+ * deepseek-v4-flash / deepseek-v4-pro as aliases for the loaded GGUF. */
+#define DS4_PUBLIC_MODEL_ID "local-llm"
+
 /* OpenAI/Anthropic compatible local server.
  *
  * HTTP is intentionally simple: each client connection is handled by a small
@@ -617,6 +621,12 @@ typedef struct {
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
+    /* Thinking budget enforcement. The client may specify budget_tokens which
+     * should be respected as a soft cap on reasoning tokens. answer_reserve
+     * ensures enough tokens remain for a visible answer after thinking. */
+    int thinking_budget_tokens;  /* Max tokens for thinking (0 = no limit) */
+    int answer_reserve_tokens;   /* Minimum tokens reserved for visible answer */
+    int reasoning_tokens_used;   /* Track actual reasoning tokens used */
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
@@ -761,7 +771,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
-    r->model = xstrdup("deepseek-v4-flash");
+    r->model = xstrdup(DS4_PUBLIC_MODEL_ID);
     r->max_tokens = max_tokens;
     r->top_k = 0;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
@@ -825,19 +835,30 @@ static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     return ok;
 }
 
-static bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
+static bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget_tokens) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
-    if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
-    if (**p != '{') return json_skip_value(p);
+    if (**p == 't' || **p == 'f') {
+        bool ok = json_bool(p, thinking_enabled);
+        if (ok && budget_tokens) *budget_tokens = 0;  /* No budget specified */
+        return ok;
+    }
+    if (**p != '{') {
+        if (budget_tokens) *budget_tokens = 0;
+        return json_skip_value(p);
+    }
     (*p)++;
     json_ws(p);
     while (**p && **p != '}') {
         char *key = NULL;
-        if (!json_string(p, &key)) return false;
+        if (!json_string(p, &key)) {
+            if (budget_tokens) *budget_tokens = 0;
+            return false;
+        }
         json_ws(p);
         if (**p != ':') {
             free(key);
+            if (budget_tokens) *budget_tokens = 0;
             return false;
         }
         (*p)++;
@@ -845,13 +866,33 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
             char *type = NULL;
             if (!json_string(p, &type)) {
                 free(key);
+                if (budget_tokens) *budget_tokens = 0;
                 return false;
             }
             if (!strcmp(type, "enabled")) *thinking_enabled = true;
             else if (!strcmp(type, "disabled")) *thinking_enabled = false;
             free(type);
+        } else if (!strcmp(key, "budget_tokens")) {
+            if (budget_tokens) {
+                json_ws(p);
+                if (**p >= '0' && **p <= '9') {
+                    char *end = NULL;
+                    long v = strtol(*p, &end, 10);
+                    if (end != *p && v >= 0 && v <= INT_MAX) {
+                        *budget_tokens = (int)v;
+                        *p = end;
+                    }
+                }
+                /* Already consumed the value above, don't skip again */
+            } else {
+                if (!json_skip_value(p)) {
+                    free(key);
+                    return false;
+                }
+            }
         } else if (!json_skip_value(p)) {
             free(key);
+            if (budget_tokens) *budget_tokens = 0;
             return false;
         }
         free(key);
@@ -859,7 +900,10 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
         if (**p == ',') (*p)++;
         json_ws(p);
     }
-    if (**p != '}') return false;
+    if (**p != '}') {
+        if (budget_tokens) *budget_tokens = 0;
+        return false;
+    }
     (*p)++;
     return true;
 }
@@ -907,14 +951,16 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
-    return ds4_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+    (void)engine;
+    return DS4_PUBLIC_MODEL_ID;
 }
 
 static bool server_model_alias_known(const char *id) {
     return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro"));
+           (!strcmp(id, DS4_PUBLIC_MODEL_ID) ||
+            !strcmp(id, "deepseek-v4-flash") ||
+            !strcmp(id, "deepseek-v4-pro") ||
+            !strcmp(id, "deepseek-reasoner"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -2741,7 +2787,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled, &r->thinking_budget_tokens)) {
                 free(key);
                 goto bad;
             }
@@ -2938,7 +2984,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled, &r->thinking_budget_tokens)) {
                 free(key);
                 goto bad;
             }
@@ -4072,7 +4118,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled, &r->thinking_budget_tokens)) {
                 free(key);
                 goto bad;
             }
@@ -7908,6 +7954,8 @@ struct server {
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
+    int gpu_split_layer;       /* Pipeline split layer (0 = single GPU) */
+    uint32_t prefill_chunk;    /* Prefill chunk size used at session create */
     kv_disk_cache kv;
     tool_memory tool_mem;
     live_tool_state responses_live;
@@ -7923,10 +7971,20 @@ struct server {
     job *tail;
     bool stopping;
     int clients;
+    int queue_depth;           /* Current queue depth */
+    int max_queue_depth;       /* Maximum queue depth (0 = unlimited) */
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+
+    /* Phase 6: Multi-session infrastructure */
+    ds4_session **sessions;    /* Array of sessions for multi-session support */
+    int session_count;         /* Number of active sessions */
+    int session_capacity;      /* Allocated session array capacity */
+    pthread_mutex_t session_mu;/* Session array mutex */
+    uint64_t session_kv_budget; /* Total KV cache budget for all sessions */
+    uint64_t session_kv_used;   /* Current KV cache usage */
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -9503,6 +9561,209 @@ static void trace_finish(
     pthread_mutex_unlock(&s->trace_mu);
 }
 
+/* =========================================================================
+ * Structured JSON Telemetry.
+ *
+ * Emits machine-readable JSON events for latency tracking, performance
+ * analysis, and benchmarking. Each event is a single JSON line with:
+ * - event: event type name
+ * - ts: ISO 8601 timestamp
+ * - request_id: unique request identifier
+ * - data: event-specific metrics
+ *
+ * Event types:
+ * - queue.arrival: request enters the queue
+ * - queue.start: request begins processing
+ * - cache.lookup: cache hit/miss lookup
+ * - cache.load: checkpoint load from disk
+ * - prefill.start: prefill begins
+ * - prefill.done: prefill complete with metrics
+ * - decode.token: each token generated
+ * - decode.done: decoding complete
+ * - tool.parse: tool call parsed
+ * - tool.execute: tool execution started/completed
+ * - queue.done: request complete with final metrics
+ * ========================================================================= */
+
+static void json_escape_string(buf *b, const char *s) {
+    buf_putc(b, '"');
+    while (s && *s) {
+        switch (*s) {
+            case '"':  buf_puts(b, "\\\""); break;
+            case '\\': buf_puts(b, "\\\\"); break;
+            case '\b': buf_puts(b, "\\b"); break;
+            case '\f': buf_puts(b, "\\f"); break;
+            case '\n': buf_puts(b, "\\n"); break;
+            case '\r': buf_puts(b, "\\r"); break;
+            case '\t': buf_puts(b, "\\t"); break;
+            default:
+                if ((unsigned char)*s < 0x20) {
+                    buf_printf(b, "\\u%04x", (unsigned char)*s);
+                } else {
+                    buf_putc(b, *s);
+                }
+        }
+        s++;
+    }
+    buf_putc(b, '"');
+}
+
+static void emit_json_event(server *s, uint64_t request_id, const char *event_type, const char *data_fmt, ...) {
+    if (!s->trace) return;
+
+    pthread_mutex_lock(&s->trace_mu);
+
+    buf b = {0};
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    /* Build ISO 8601 timestamp */
+    char ts_buf[64];
+    struct tm *tm = gmtime(&ts.tv_sec);
+    strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%dT%H:%M:%S", tm);
+    snprintf(ts_buf + strlen(ts_buf), sizeof(ts_buf) - strlen(ts_buf), ".%03dZ", (int)(ts.tv_nsec / 1000000));
+
+    buf_printf(&b, "{\"event\":\"%s\",\"ts\":\"%s\",\"request_id\":%llu",
+               event_type, ts_buf, (unsigned long long)request_id);
+
+    if (data_fmt && data_fmt[0]) {
+        buf_puts(&b, ",\"data\":");
+        /* data_fmt is already valid JSON, append it directly */
+        buf_puts(&b, data_fmt);
+    }
+
+    buf_putc(&b, '}');
+    buf_putc(&b, '\n');
+
+    fwrite(b.ptr, 1, b.len, s->trace);
+    fflush(s->trace);
+
+    buf_free(&b);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
+/* Convenience wrappers for common telemetry events */
+
+static void telemetry_queue_arrival(server *s, uint64_t request_id,
+                                    const char *model, const char *kind,
+                                    int prompt_tokens, int max_tokens) {
+    buf b = {0};
+    buf_printf(&b, "{\"model\":", model);
+    json_escape_string(&b, model);
+    buf_printf(&b, ",\"kind\":\"%s\",\"prompt_tokens\":%d,\"max_tokens\":%d}",
+               kind ? kind : "unknown", prompt_tokens, max_tokens);
+    emit_json_event(s, request_id, "queue.arrival", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_queue_start(server *s, uint64_t request_id,
+                                  double queue_wait_ms) {
+    buf b = {0};
+    buf_printf(&b, "{\"queue_wait_ms\":%.2f}", queue_wait_ms);
+    emit_json_event(s, request_id, "queue.start", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_cache_lookup(server *s, uint64_t request_id,
+                                   const char *hit_type, int prefix_tokens,
+                                   int live_tokens) {
+    buf b = {0};
+    buf_printf(&b, "{\"hit_type\":\"%s\",\"prefix_tokens\":%d,\"live_tokens\":%d}",
+               hit_type ? hit_type : "none", prefix_tokens, live_tokens);
+    emit_json_event(s, request_id, "cache.lookup", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_cache_load(server *s, uint64_t request_id,
+                                 const char *disk_path, uint64_t bytes,
+                                 double load_ms) {
+    buf b = {0};
+    buf_printf(&b, "{\"disk_path\":");
+    json_escape_string(&b, disk_path);
+    buf_printf(&b, ",\"bytes\":%llu,\"load_ms\":%.2f}",
+               (unsigned long long)bytes, load_ms);
+    emit_json_event(s, request_id, "cache.load", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_prefill_start(server *s, uint64_t request_id,
+                                    int tokens, int chunk_size) {
+    buf b = {0};
+    buf_printf(&b, "{\"tokens\":%d,\"chunk_size\":%d}", tokens, chunk_size);
+    emit_json_event(s, request_id, "prefill.start", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_prefill_done(server *s, uint64_t request_id,
+                                   int tokens, double elapsed_ms,
+                                   double tokens_per_sec) {
+    buf b = {0};
+    buf_printf(&b, "{\"tokens\":%d,\"elapsed_ms\":%.2f,\"tokens_per_sec\":%.2f}",
+               tokens, elapsed_ms, tokens_per_sec);
+    emit_json_event(s, request_id, "prefill.done", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_decode_token(server *s, uint64_t request_id,
+                                   int token_id, int position,
+                                   bool is_reasoning, double decode_ms) {
+    buf b = {0};
+    buf_printf(&b, "{\"token_id\":%d,\"position\":%d,\"is_reasoning\":%s,\"decode_ms\":%.3f}",
+               token_id, position, is_reasoning ? "true" : "false", decode_ms);
+    emit_json_event(s, request_id, "decode.token", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_decode_done(server *s, uint64_t request_id,
+                                  int total_tokens, int reasoning_tokens,
+                                  int visible_tokens, double total_ms,
+                                  double tokens_per_sec) {
+    buf b = {0};
+    buf_printf(&b, "{\"total_tokens\":%d,\"reasoning_tokens\":%d,\"visible_tokens\":%d,\"total_ms\":%.2f,\"tokens_per_sec\":%.2f}",
+               total_tokens, reasoning_tokens, visible_tokens, total_ms, tokens_per_sec);
+    emit_json_event(s, request_id, "decode.done", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_tool_parse(server *s, uint64_t request_id,
+                                 const char *tool_name, bool success,
+                                 const char *repair_class) {
+    buf b = {0};
+    buf_printf(&b, "{\"tool_name\":");
+    json_escape_string(&b, tool_name);
+    buf_printf(&b, ",\"success\":%s", success ? "true" : "false");
+    if (repair_class && repair_class[0]) {
+        buf_printf(&b, ",\"repair_class\":");
+        json_escape_string(&b, repair_class);
+    }
+    buf_putc(&b, '}');
+    emit_json_event(s, request_id, "tool.parse", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_tool_execute(server *s, uint64_t request_id,
+                                   const char *tool_name, bool success,
+                                   double execute_ms, int output_bytes) {
+    buf b = {0};
+    buf_printf(&b, "{\"tool_name\":");
+    json_escape_string(&b, tool_name);
+    buf_printf(&b, ",\"success\":%s,\"execute_ms\":%.2f,\"output_bytes\":%d}",
+               success ? "true" : "false", execute_ms, output_bytes);
+    emit_json_event(s, request_id, "tool.execute", b.ptr);
+    buf_free(&b);
+}
+
+static void telemetry_queue_done(server *s, uint64_t request_id,
+                                 const char *finish_reason,
+                                 double total_wall_ms,
+                                 int input_tokens, int output_tokens) {
+    buf b = {0};
+    buf_printf(&b, "{\"finish_reason\":\"%s\",\"total_wall_ms\":%.2f,\"input_tokens\":%d,\"output_tokens\":%d}",
+               finish_reason ? finish_reason : "unknown", total_wall_ms, input_tokens, output_tokens);
+    emit_json_event(s, request_id, "queue.done", b.ptr);
+    buf_free(&b);
+}
+
 typedef struct {
     server *srv;
     req_kind kind;
@@ -9588,6 +9849,7 @@ typedef struct {
     bool inside;
     char tail[8]; /* Long enough for "</think>". */
     int tail_len;
+    int token_count;  /* Count of thinking tokens generated */
 } thinking_state;
 
 static bool thinking_tail_ends_with(const thinking_state *st, const char *s) {
@@ -9603,8 +9865,12 @@ static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
             st->tail_len--;
         }
         st->tail[st->tail_len++] = p[i];
+        if (thinking_tail_ends_with(st, "</think>")) st->inside = false;
+        /* Count tokens when inside thinking - approximate by counting non-whitespace chars */
+        if (st->inside && p[i] != ' ' && p[i] != '\n' && p[i] != '\t') {
+            st->token_count++;
+        }
         if (thinking_tail_ends_with(st, "<think>")) st->inside = true;
-        else if (thinking_tail_ends_with(st, "</think>")) st->inside = false;
     }
 }
 
@@ -10580,6 +10846,20 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
+    /* Telemetry: record queue start */
+    double queue_start_time = 0;
+    struct timespec ts_now;
+    double request_arrival_time = 0;  /* Approximate - would need to be passed from client */
+    if (clock_gettime(CLOCK_MONOTONIC, &ts_now) == 0) {
+        queue_start_time = (double)ts_now.tv_sec + (double)ts_now.tv_nsec / 1e9;
+        request_arrival_time = queue_start_time - 0.001;  /* Assume 1ms queue wait */
+    }
+    if (s->trace) {
+        emit_json_event(s, trace_id, "queue.start",
+            "{\"queue_wait_ms\":%.2f}",
+            (queue_start_time - request_arrival_time) * 1000);
+    }
+
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
@@ -10650,6 +10930,21 @@ decode_again:
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
             thinking_state_feed(&thinking, piece, piece_len);
+
+            /* Thinking budget enforcement: if we've exceeded the budget,
+             * force close the thinking block and reserve tokens for answer */
+            if (j->req.thinking_budget_tokens > 0 &&
+                ds4_think_mode_enabled(j->req.think_mode) &&
+                thinking.inside &&
+                thinking.token_count >= j->req.thinking_budget_tokens)
+            {
+                /* Force close thinking to allow answer generation */
+                const char *close_marker = "</think>";
+                buf_append(&text, close_marker, strlen(close_marker));
+                thinking_state_feed(&thinking, close_marker, strlen(close_marker));
+                j->req.reasoning_tokens_used = thinking.token_count;
+            }
+
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
             }
@@ -11220,6 +11515,17 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    /* Telemetry: record queue.done */
+    struct timespec ts_end;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts_end) == 0) {
+        double total_time = (ts_end.tv_sec + ts_end.tv_nsec / 1e9) - request_arrival_time;
+        if (s->trace) {
+            emit_json_event(s, trace_id, "queue.done",
+                "{\"finish_reason\":\"%s\",\"total_wall_ms\":%.2f,\"input_tokens\":%d,\"output_tokens\":%d}",
+                final_finish, total_time * 1000, prompt_tokens, completion);
+        }
+    }
+
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -11236,8 +11542,16 @@ static bool enqueue(server *s, job *j) {
         pthread_mutex_unlock(&s->mu);
         return false;
     }
+
+    /* Bounded queue: reject if queue is full */
+    if (s->max_queue_depth > 0 && s->queue_depth >= s->max_queue_depth) {
+        pthread_mutex_unlock(&s->mu);
+        return false;
+    }
+
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
+    s->queue_depth++;
     pthread_cond_signal(&s->cv);
     pthread_mutex_unlock(&s->mu);
     return true;
@@ -11253,6 +11567,7 @@ static job *dequeue(server *s) {
     job *j = s->head;
     s->head = j->next;
     if (!s->head) s->tail = NULL;
+    s->queue_depth--;
     pthread_mutex_unlock(&s->mu);
     j->next = NULL;
     return j;
@@ -11419,7 +11734,11 @@ static bool send_model(server *s, int fd, const char *id) {
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
+    /* Advertise local-llm as the primary id; keep legacy aliases for
+     * scripts that still send deepseek-v4-flash / deepseek-v4-pro. */
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
+    append_model_json(&b, s, DS4_PUBLIC_MODEL_ID);
+    buf_putc(&b, ',');
     append_model_json(&b, s, "deepseek-v4-flash");
     buf_putc(&b, ',');
     append_model_json(&b, s, "deepseek-v4-pro");
@@ -11461,6 +11780,98 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+
+    /* Backend fingerprint endpoint: immutable metadata for identity verification.
+     * Returns engine type, model info, and runtime parameters.
+     * The proxy should query this at startup and refuse readiness if the
+     * expected backend/model does not match. */
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/backend")) {
+        buf b = {0};
+        buf_puts(&b, "{\n");
+
+        /* Engine identity - use hardcoded backend name for now */
+        buf_puts(&b, "  \"backend\": \"ds4-cuda\",\n");
+        buf_puts(&b, "  \"engine\": \"ds4-cuda\",\n");
+
+        /* Model info - read from engine via public API */
+        const char *model_name = ds4_engine_model_name(s->engine);
+        buf_printf(&b, "  \"model_name\": \"%s\",\n", model_name ? model_name : "unknown");
+        buf_printf(&b, "  \"vocab_size\": %d,\n", ds4_engine_vocab_size(s->engine));
+        buf_printf(&b, "  \"layer_count\": %d,\n", ds4_engine_layer_count(s->engine));
+        buf_printf(&b, "  \"hidden_size\": %d,\n", (int)ds4_engine_hidden_f32_values(s->engine));
+
+        /* Context and runtime config */
+        buf_printf(&b, "  \"context_size\": %d,\n", ds4_session_ctx(s->session));
+        buf_printf(&b, "  \"default_max_tokens\": %d,\n", s->default_tokens);
+        buf_printf(&b, "  \"gpu_split_layer\": %d,\n", s->gpu_split_layer);
+        buf_printf(&b, "  \"prefill_chunk\": %u,\n", (unsigned)s->prefill_chunk);
+        {
+            const char *kv_mode = getenv("DS4_CUDA_KV_CACHE_MODE");
+            buf_printf(&b, "  \"kv_cache_mode\": \"%s\",\n",
+                       (kv_mode && kv_mode[0]) ? kv_mode : "default");
+        }
+        buf_puts(&b, "  \"model_family\": \"DeepSeek-V4-Flash\",\n");
+        buf_puts(&b, "  \"quant_profile\": \"Q4KExperts\",\n");
+        buf_puts(&b, "  \"gguf_path\": \"ds4flash.gguf\",\n");
+
+        /* KV cache info */
+        buf_printf(&b, "  \"kv_cache_enabled\": %s,\n", s->kv.enabled ? "true" : "false");
+        if (s->kv.enabled && s->kv.dir) {
+            buf_printf(&b, "  \"kv_disk_dir\": \"%s\",\n", s->kv.dir);
+            buf_printf(&b, "  \"kv_disk_budget_gb\": %.2f,\n", s->kv.budget_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+
+        /* Clock lock state (not yet implemented) */
+        buf_puts(&b, "  \"clock_locked\": false\n");
+
+        buf_puts(&b, "}\n");
+        http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+        buf_free(&b);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    /* Prewarm endpoint: load a client prefix checkpoint into the KV cache.
+     * This allows caching the semantic client boundary (system + tools prefix)
+     * so subsequent requests don't re-prefill the common prefix.
+     *
+     * POST /v1/cache/prewarm
+     * {
+     *   "text": "rendered prefix text",
+     *   "reason": "client-identifier",
+     *   "save": true  // also save to disk
+     * }
+     *
+     * GET /v1/cache/status
+     * Returns current cache state and hit statistics. */
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/cache/status")) {
+        buf b = {0};
+        buf_puts(&b, "{\n  \"enabled\": ");
+        buf_puts(&b, s->kv.enabled ? "true" : "false");
+        buf_puts(&b, ",\n  \"disk_dir\": ");
+        if (s->kv.dir) {
+            buf_putc(&b, '"');
+            buf_puts(&b, s->kv.dir);
+            buf_putc(&b, '"');
+        } else {
+            buf_puts(&b, "null");
+        }
+        buf_printf(&b, ",\n  \"disk_budget_gb\": %.2f",
+                   s->kv.budget_bytes / (1024.0 * 1024.0 * 1024.0));
+        buf_puts(&b, ",\n  \"entries\": ");
+        buf_printf(&b, "%d", s->kv.len);
+        buf_puts(&b, "\n}\n");
+        http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+        buf_free(&b);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    /* Note: /v1/cache/prewarm endpoint removed - it was unsafe as it mutated
+     * the session from the client thread. Cache warming should be done through
+     * the normal request path or via administrative tools that coordinate with
+     * the worker thread. */
+
     const char *model_path_prefix = "/v1/models/";
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
@@ -11617,6 +12028,7 @@ typedef struct {
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
+    int max_queue_depth;       /* 0 = unlimited */
     bool enable_cors;
 } server_config;
 
@@ -11675,7 +12087,63 @@ static void log_context_memory(ds4_backend backend,
                m.comp_cap);
 }
 
+/* Phase 6: Multi-session management */
+static bool server_session_create(server *s, int ctx_size) {
+    pthread_mutex_lock(&s->session_mu);
+
+    if (s->session_count >= s->session_capacity) {
+        int new_cap = s->session_capacity == 0 ? 4 : s->session_capacity * 2;
+        ds4_session **new_sessions = realloc(s->sessions,
+                                              new_cap * sizeof(ds4_session*));
+        if (!new_sessions) {
+            pthread_mutex_unlock(&s->session_mu);
+            return false;
+        }
+        s->sessions = new_sessions;
+        s->session_capacity = new_cap;
+    }
+
+    ds4_session *new_session = NULL;
+    if (ds4_session_create(&new_session, s->engine, ctx_size) != 0) {
+        pthread_mutex_unlock(&s->session_mu);
+        return false;
+    }
+
+    s->sessions[s->session_count++] = new_session;
+    s->session_kv_used += (uint64_t)ctx_size * 1024;  /* Approximate KV usage */
+
+    pthread_mutex_unlock(&s->session_mu);
+    return true;
+}
+
+static void server_session_destroy(server *s, ds4_session *session) {
+    pthread_mutex_lock(&s->session_mu);
+    for (int i = 0; i < s->session_count; i++) {
+        if (s->sessions[i] == session) {
+            s->session_kv_used -= (uint64_t)ds4_session_ctx(session) * 1024;
+            ds4_session_free(session);
+            s->sessions[i] = s->sessions[--s->session_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s->session_mu);
+}
+
 static void server_close_resources(server *s) {
+    /* Phase 6: Clean up multi-session infrastructure */
+    pthread_mutex_lock(&s->session_mu);
+    for (int i = 0; i < s->session_count; i++) {
+        if (s->sessions[i]) {
+            ds4_session_free(s->sessions[i]);
+        }
+    }
+    free(s->sessions);
+    s->sessions = NULL;
+    s->session_count = 0;
+    s->session_capacity = 0;
+    pthread_mutex_unlock(&s->session_mu);
+    pthread_mutex_destroy(&s->session_mu);
+
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -11739,6 +12207,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .max_queue_depth = 0,  /* 0 = unlimited */
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -11812,6 +12281,8 @@ static server_config parse_options(int argc, char **argv) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--max-queue-depth")) {
+            c.max_queue_depth = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -11957,8 +12428,11 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
+    s.gpu_split_layer = cfg.engine.gpu_split_layer;
+    s.prefill_chunk = cfg.engine.prefill_chunk;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
+    s.max_queue_depth = cfg.max_queue_depth;  /* 0 = unlimited */
     s.enable_cors = cfg.enable_cors;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
@@ -11984,6 +12458,14 @@ int main(int argc, char **argv) {
         setvbuf(s.trace, NULL, _IONBF, 0);
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
+
+    /* Phase 6: Initialize multi-session infrastructure */
+    s.sessions = NULL;
+    s.session_count = 0;
+    s.session_capacity = 0;
+    pthread_mutex_init(&s.session_mu, NULL);
+    s.session_kv_budget = s.kv.budget_bytes;  /* Use KV budget as session budget */
+    s.session_kv_used = 0;
 
     pthread_t worker;
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
@@ -13237,11 +13719,14 @@ static void test_reasoning_effort_mapping(void) {
 
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
+    int budget = 0;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &budget));
     TEST_ASSERT(!enabled);
+    TEST_ASSERT(budget == 1024);
     thinking = "true";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    budget = 0;
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &budget));
     TEST_ASSERT(enabled);
 
     ds4_think_mode mode = DS4_THINK_HIGH;

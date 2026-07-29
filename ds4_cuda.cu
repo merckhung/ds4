@@ -3,6 +3,14 @@
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cuda_profiler_api.h>
+
+/* CUDA Graph support requires CUDA 10+ */
+#if CUDART_VERSION >= 10000
+#define DS4_CUDA_GRAPHS_SUPPORTED 1
+#else
+#define DS4_CUDA_GRAPHS_SUPPORTED 0
+#endif
 
 #include <stdint.h>
 #include <errno.h>
@@ -19,6 +27,72 @@
 #include <vector>
 
 #include "ds4_gpu.h"
+
+/* CUDA profiling hooks for launch overhead analysis.
+ *
+ * These counters track kernel launches and synchronization points to help
+ * identify CPU-side launch overhead as a bottleneck. Use with Nsight Systems
+ * to correlate with actual kernel execution times.
+ *
+ * Enable profiling:
+ *   DS4_CUDA_PROFILE=1 ./ds4-server ...
+ *   or programmatically: cudaProfilerStart()/cudaProfilerStop()
+ */
+static int g_cuda_profile_enabled = 0;
+static unsigned long g_kernel_launch_count = 0;
+static unsigned long g_cuda_sync_count = 0;
+static unsigned long g_cuda_event_record_count = 0;
+static unsigned long g_cuda_event_sync_count = 0;
+static struct timespec g_kernel_total_time_ns = {0, 0};
+
+/* Profile toggle via environment */
+static void cuda_profile_init(void) {
+    const char *env = getenv("DS4_CUDA_PROFILE");
+    if (env && env[0] && env[0] != '0') {
+        g_cuda_profile_enabled = 1;
+        fprintf(stderr, "ds4-cuda: profiling enabled\n");
+    }
+}
+
+/* Call before each kernel launch when profiling is enabled */
+static inline void cuda_profile_launch_start(struct timespec *start) {
+    if (g_cuda_profile_enabled) {
+        clock_gettime(CLOCK_MONOTONIC, start);
+    }
+}
+
+static inline void cuda_profile_launch_end(const struct timespec *start) {
+    if (g_cuda_profile_enabled) {
+        struct timespec end;
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        g_kernel_launch_count++;
+        g_kernel_total_time_ns.tv_nsec += (end.tv_nsec - start->tv_nsec);
+        g_kernel_total_time_ns.tv_sec += (end.tv_sec - start->tv_sec);
+        if (g_kernel_total_time_ns.tv_nsec >= 1000000000L) {
+            g_kernel_total_time_ns.tv_sec++;
+            g_kernel_total_time_ns.tv_nsec -= 1000000000L;
+        }
+    }
+}
+
+/* Print profiling summary */
+static void cuda_profile_report(void) {
+    if (!g_cuda_profile_enabled) return;
+
+    fprintf(stderr, "ds4-cuda: profiling summary\n");
+    fprintf(stderr, "  kernel launches: %lu\n", g_kernel_launch_count);
+    fprintf(stderr, "  cuda syncs: %lu\n", g_cuda_sync_count);
+    fprintf(stderr, "  event records: %lu\n", g_cuda_event_record_count);
+    fprintf(stderr, "  event syncs: %lu\n", g_cuda_event_sync_count);
+    fprintf(stderr, "  total launch overhead: %ld.%09lds\n",
+            g_kernel_total_time_ns.tv_sec, g_kernel_total_time_ns.tv_nsec);
+    if (g_kernel_launch_count > 0) {
+        double avg_ns = (double)g_kernel_total_time_ns.tv_sec * 1e9 +
+                        (double)g_kernel_total_time_ns.tv_nsec;
+        avg_ns /= g_kernel_launch_count;
+        fprintf(stderr, "  avg launch overhead: %.2f ns\n", avg_ns);
+    }
+}
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -93,6 +167,7 @@ static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas_array[DS4_MAX_GPUS];
 static int g_cublas_ready_array[DS4_MAX_GPUS];
 static cudaStream_t g_streams[DS4_MAX_GPUS];
+static cudaEvent_t g_p2p_copy_events[DS4_MAX_GPUS];  /* Events for P2P copy completion */
 static int g_device_count = 0;
 
 static cublasHandle_t get_cublas_handle(void) {
@@ -2284,6 +2359,9 @@ extern "C" void ds4_gpu_set_device(int device_id) {
 }
 
 extern "C" int ds4_gpu_init(void) {
+    /* Initialize CUDA profiling if enabled */
+    cuda_profile_init();
+
     if (cudaGetDeviceCount(&g_device_count) != cudaSuccess) {
         g_device_count = 1;
     }
@@ -2327,7 +2405,13 @@ extern "C" int ds4_gpu_init(void) {
         }
     }
 
-    // Set default device back to 0
+    /* Initialize P2P copy events */
+    for (int i = 0; i < g_device_count; i++) {
+        cudaSetDevice(i);
+        (void)cudaEventCreateWithFlags(&g_p2p_copy_events[i], cudaEventDisableTiming);
+    }
+
+    /* Set default device back to 0 */
     cudaSetDevice(0);
 
     cudaDeviceProp prop;
@@ -2338,7 +2422,16 @@ extern "C" int ds4_gpu_init(void) {
     return 1;
 }
 
+/* Forward declaration for CUDA graph cleanup */
+void ds4_gpu_graphs_cleanup(void);
+
 extern "C" void ds4_gpu_cleanup(void) {
+    /* Print CUDA profiling summary if enabled */
+    cuda_profile_report();
+
+    /* Destroy all CUDA graphs */
+    ds4_gpu_graphs_cleanup();
+
     int prev_device = 0;
     cudaGetDevice(&prev_device);
     for (int i = 0; i < g_device_count; i++) {
@@ -2350,6 +2443,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         if (g_streams[i]) {
             (void)cudaStreamDestroy(g_streams[i]);
             g_streams[i] = NULL;
+        }
+        if (g_p2p_copy_events[i]) {
+            (void)cudaEventDestroy(g_p2p_copy_events[i]);
+            g_p2p_copy_events[i] = NULL;
         }
     }
     cudaSetDevice(prev_device);
@@ -2611,14 +2708,101 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+/* =========================================================================
+ * CUDA Graph Support (Infrastructure Only)
+ *
+ * CUDA Graphs reduce CPU launch overhead by capturing a sequence of CUDA
+ * operations and replaying them with a single launch. This is particularly
+ * effective for autoregressive decode where the same sequence of kernels
+ * runs for each token.
+ *
+ * Full implementation requires CUDA 11+ and careful graph topology stabilization.
+ * This provides the infrastructure; actual graph capture for the decode pipeline
+ * requires stabilizing the kernel sequence (position-dependent compression,
+ * dynamic expert routing, etc.).
+ * ========================================================================= */
+
+/* Stub implementations - full graph capture requires CUDA 11+ APIs */
+void ds4_gpu_graphs_cleanup(void) {
+    /* Full implementation would destroy captured graphs */
+}
+
+void ds4_gpu_graphs_disable(void) {
+    /* Full implementation would disable graph usage */
+}
+
+int ds4_gpu_graphs_enabled(void) {
+    /* Full implementation would return whether graphs are enabled */
+    return 0;  /* Disabled until full implementation */
+}
+
+/* Explicit event version of P2P copy that records completion event instead of
+ * immediate synchronization. The caller must wait on the event later. */
+extern "C" int ds4_gpu_tensor_copy_p2p_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+                                              void *out_event_ptr) {
+    if (!dst || !src) return 0;
+    if (dst->bytes < src->bytes) return 0;
+
+    if (dst->device_id == src->device_id) {
+        /* Same device: record event immediately */
+        if (out_event_ptr) {
+            /* Allocate and record event */
+            cudaEvent_t evt;
+            cudaError_t err = cudaEventCreate(&evt);
+            if (err != cudaSuccess) return 0;
+            err = cudaEventRecord(evt, g_streams[dst->device_id]);
+            if (err != cudaSuccess) {
+                cudaEventDestroy(evt);
+                return 0;
+            }
+            *(cudaEvent_t*)out_event_ptr = evt;
+        }
+        return 1;
+    }
+
+    cudaStream_t stream = g_streams[dst->device_id];
+    cudaError_t err = cudaMemcpyPeerAsync(dst->ptr, dst->device_id,
+                                          src->ptr, src->device_id,
+                                          src->bytes, stream);
+    if (err != cudaSuccess) return 0;
+
+    /* Record completion event on destination stream */
+    if (out_event_ptr) {
+        cudaEvent_t evt;
+        err = cudaEventCreate(&evt);
+        if (err != cudaSuccess) return 0;
+        err = cudaEventRecord(evt, stream);
+        if (err != cudaSuccess) {
+            cudaEventDestroy(evt);
+            return 0;
+        }
+        *(cudaEvent_t*)out_event_ptr = evt;
+    }
+
+    return 1;
+}
+
+/* Wait for a P2P copy event to complete.
+ * event_ptr is the cudaEvent_t value itself (stored by p2p_async into the
+ * caller's void* out-slot), NOT a pointer-to-event. */
+extern "C" int ds4_gpu_tensor_copy_p2p_wait(void *event_ptr) {
+    if (!event_ptr) return 1;
+    g_cuda_sync_count++;
+    cudaEvent_t event = (cudaEvent_t)event_ptr;
+    int result = cuda_ok(cudaEventSynchronize(event), "p2p copy event wait");
+    /* Clean up the event after waiting */
+    cudaEventDestroy(event);
+    return result;
+}
+
 extern "C" int ds4_gpu_tensor_copy_p2p(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src) {
     if (!dst || !src) return 0;
     if (dst->bytes < src->bytes) return 0;
-    
+
     if (dst->device_id == src->device_id) {
         return ds4_gpu_tensor_copy(dst, 0, src, 0, src->bytes);
     }
-    
+
     cudaStream_t stream = g_streams[dst->device_id];
     cudaError_t err = cudaMemcpyPeerAsync(dst->ptr, dst->device_id,
                                           src->ptr, src->device_id,
@@ -2626,6 +2810,7 @@ extern "C" int ds4_gpu_tensor_copy_p2p(ds4_gpu_tensor *dst, const ds4_gpu_tensor
     if (err != cudaSuccess) return 0;
     /* Consumers launch on the destination device's default stream, which has
      * no ordering against g_streams[dst]; block until the copy lands. */
+    g_cuda_sync_count++;
     return cuda_ok(cudaStreamSynchronize(stream), "p2p copy sync");
 }
 

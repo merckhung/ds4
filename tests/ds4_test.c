@@ -88,8 +88,19 @@ static void test_restore_canonical_streaming_prefill(
 static ds4_engine *test_open_engine(bool quality) {
     ds4_engine *engine = NULL;
     /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
-     * verify regression can reuse it; draft=4 hits the multi-row verify path. */
+     * verify regression can reuse it; draft=4 hits the multi-row verify path.
+     * DS4_TEST_GPU_SPLIT_LAYER enables dual-GPU pipeline parallelism for testing
+     * the production path on multi-GPU systems. */
     const char *mtp = getenv("DS4_TEST_MTP");
+    const char *gpu_split_str = getenv("DS4_TEST_GPU_SPLIT_LAYER");
+    int gpu_split_layer = 0;
+    if (gpu_split_str && gpu_split_str[0]) {
+        char *end = NULL;
+        long v = strtol(gpu_split_str, &end, 10);
+        if (end != gpu_split_str && v > 0) {
+            gpu_split_layer = (int)v;
+        }
+    }
     ds4_engine_options opt = {
         .model_path = test_model_path(),
 #ifdef __APPLE__
@@ -106,6 +117,7 @@ static ds4_engine *test_open_engine(bool quality) {
             test_env_gib("DS4_TEST_SSD_STREAMING_CACHE_GB"),
         .ssd_streaming_preload_experts =
             test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
+        .gpu_split_layer = (uint32_t)gpu_split_layer,
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
     };

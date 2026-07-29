@@ -29,6 +29,16 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_device(uint64_t bytes, int device_id);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 int ds4_gpu_tensor_copy_p2p(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src);
+
+/* Async P2P copy with event - for explicit stream ordering */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int ds4_gpu_tensor_copy_p2p_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, void *out_event);
+int ds4_gpu_tensor_copy_p2p_wait(void *event);
+#ifdef __cplusplus
+}
+#endif
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);

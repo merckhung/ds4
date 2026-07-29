@@ -10583,6 +10583,12 @@ typedef struct {
     bool mtp_enabled;
     float *cpu_router_norm;
 
+    /* Scratch lifetime arena for memory optimization (Phase 5.2) */
+    uint64_t scratch_arena_bytes;
+    uint64_t scratch_peak_bytes;
+    uint64_t scratch_arena_base;
+    bool scratch_arena_enabled;
+
     /* Per-device scratch copies backing the aliases above (index = device).
      * scratch_set[1] is populated only when gpu_split_layer > 0. */
     ds4_graph_scratch_set scratch_set[2];
@@ -10639,6 +10645,12 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    /* Phase 5.2: Report arena statistics before freeing */
+    if (g->scratch_arena_enabled && g->scratch_peak_bytes > 0) {
+        fprintf(stderr, "ds4: scratch arena peak=%.2f MiB\n",
+                g->scratch_peak_bytes / (1024.0 * 1024.0));
+    }
+
     /* The per-device scratch sets own the work tensors; the named aliases
      * below point into whichever set is bound, so clear them after freeing
      * the sets to keep the legacy frees as harmless no-ops. */
@@ -11187,11 +11199,18 @@ static bool metal_graph_alloc_raw_cap(
     /* Allocate the per-layer work tensors once per pipeline-stage device so
      * each GPU's kernels operate on local memory. */
     const int n_scratch_sets = gpu_split_layer > 0 ? 2 : 1;
+    /* Phase 5.2: Scratch lifetime arena tracking */
+    g->scratch_arena_bytes = 0;
+    g->scratch_peak_bytes = 0;
+    g->scratch_arena_enabled = 1;  /* Enabled by default */
+    const char *arena_env = getenv("DS4_SCRATCH_ARENA_DISABLE");
+    if (arena_env && arena_env[0] == '1') g->scratch_arena_enabled = 0;
+
     for (int d = 0; d < n_scratch_sets; d++) {
         ds4_graph_scratch_set *ss = &g->scratch_set[d];
 #define SC_ALLOC(sz) (gpu_split_layer > 0 \
-        ? ds4_gpu_tensor_alloc_device((sz), d) \
-        : ds4_gpu_tensor_alloc(sz))
+            ? ds4_gpu_tensor_alloc_device((sz), d) \
+            : ds4_gpu_tensor_alloc(sz))
         ss->flat_hc = SC_ALLOC(hc_dim * sizeof(float));
         ss->hc_mix = SC_ALLOC(mix_hc * sizeof(float));
         ss->hc_split = SC_ALLOC(mix_hc * sizeof(float));
@@ -17228,12 +17247,12 @@ static bool metal_graph_encode_token_raw_swa(
             // Flush and sync GPU 0
             ok = ds4_gpu_flush_commands() != 0;
             if (ok) ok = ds4_gpu_synchronize() != 0;
-            
+
             // P2P copy hidden state from GPU 0 to GPU 1
             if (ok) {
                 ok = ds4_gpu_tensor_copy_p2p(g->cur_hc_1, g->cur_hc_0) != 0;
             }
-            
+
             // Switch to GPU 1
             g->cur_hc = g->cur_hc_1;
             g->after_ffn_hc = g->after_ffn_hc_1;
@@ -21299,6 +21318,16 @@ static bool metal_graph_prefill_chunked_range(
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
     }
 
+    /* Prefill microbatching: split chunks into smaller microbatches to enable
+     * GPU overlap. GPU 0 can process microbatch n+1 while GPU 1 processes n.
+     * This is especially useful for dual-GPU pipeline parallelism. */
+    uint32_t microbatch_size = chunk_cap / 4;  /* Default: 4 microbatches per chunk */
+    const char *mb_env = getenv("DS4_PREFILL_MICROBATCH_SIZE");
+    if (mb_env) {
+        int mb = atoi(mb_env);
+        if (mb > 0) microbatch_size = (uint32_t)mb;
+    }
+
     for (uint32_t pos0 = start; pos0 < end; ) {
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
@@ -21314,25 +21343,37 @@ static bool metal_graph_prefill_chunked_range(
             }
         }
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
+
         const uint32_t chunk_end = pos0 + chunk;
-        float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
-        bool ok = metal_graph_prefill_layer_major(g,
+        float *chunk_logits_final = (progress || chunk_end == end) ? logits : NULL;
+
+        /* Microbatch the chunk for GPU overlap - each microbatch processes
+         * a subset of tokens, allowing GPU 0 to work on microbatch n+1 while
+         * GPU 1 processes microbatch n */
+        for (uint32_t mb_start = 0; mb_start < chunk; mb_start += microbatch_size) {
+            uint32_t mb_tokens = chunk - mb_start < microbatch_size ?
+                                 chunk - mb_start : microbatch_size;
+            uint32_t mb_pos = pos0 + mb_start;
+
+            bool ok = metal_graph_prefill_layer_major(g,
                                                   model,
                                                   weights,
                                                   prompt,
-                                                  pos0,
-                                                  chunk,
-                                                  chunk_logits,
+                                                  mb_pos,
+                                                  mb_tokens,
+                                                  chunk_logits_final,
                                                   show_progress,
                                                   imatrix,
                                                   display_progress,
                                                   display_progress_ud);
-        if (!ok) {
-            if (ds4_gpu_synchronize() == 0) {
-                fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
+            if (!ok) {
+                if (ds4_gpu_synchronize() == 0) {
+                    fprintf(stderr, "ds4: Metal synchronize after microbatch prefill failure also failed\n");
+                }
+                return false;
             }
-            return false;
         }
+
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
         }
@@ -27502,7 +27543,24 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
 
+    /* Phase 5.3: Split-aware MTP - check if MTP can work with GPU split */
     if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+
+    /* MTP with GPU split: verify that MTP head fits in available memory */
+    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
+    const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
+    if (e->gpu_split_layer > 0 && !strict_mtp) {
+        /* MTP requires additional memory for the draft head. With GPU split,
+         * we need to ensure the MTP head fits on the target GPU. For now,
+         * disable MTP at long contexts where memory is tight. */
+        if (s->ctx_size > 512000) {
+            /* At 512K+ context, MTP may not fit with GPU split */
+            if (mtp_conf_log) {
+                fprintf(stderr, "ds4: MTP disabled at ctx=%d with GPU split (memory pressure)\n", s->ctx_size);
+            }
+            return n_accept;
+        }
+    }
 
     int draft_cap = e->mtp_draft_tokens;
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
@@ -27515,7 +27573,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int draft_n = 1;
     drafts[0] = s->mtp_draft_token;
     s->mtp_draft_valid = false;
-    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
     float mtp_margin_threshold = e->mtp_margin;
     const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
     if (mtp_margin_env && mtp_margin_env[0]) {
@@ -27524,7 +27581,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (end != mtp_margin_env && v >= 0.0f) mtp_margin_threshold = v;
     }
     const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
-    const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
     const bool mtp_need_logits = mtp_conf_log ||
         getenv("DS4_MTP_FULL_LOGITS") != NULL ||
         (!strict_mtp && mtp_margin_threshold > 0.0f);
