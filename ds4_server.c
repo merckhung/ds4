@@ -4,10 +4,6 @@
 #include "ds4_kvstore.h"
 #include "rax.h"
 
-/* Public model id for local clients (Claude CLI, etc.). Backend still accepts
- * deepseek-v4-flash / deepseek-v4-pro as aliases for the loaded GGUF. */
-#define DS4_PUBLIC_MODEL_ID "local-llm"
-
 /* OpenAI/Anthropic compatible local server.
  *
  * HTTP is intentionally simple: each client connection is handled by a small
@@ -771,7 +767,8 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
-    r->model = xstrdup(DS4_PUBLIC_MODEL_ID);
+    /* Model id filled from the request body, policy, or server public id. */
+    r->model = xstrdup("");
     r->max_tokens = max_tokens;
     r->top_k = 0;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
@@ -950,17 +947,26 @@ static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
 }
 
-static const char *server_model_id_from_engine(ds4_engine *engine) {
-    (void)engine;
-    return DS4_PUBLIC_MODEL_ID;
+/* Fallback only when DS4_PUBLIC_MODEL_ID / --public-model-id is unset.
+ * Prefer configuring an explicit public id from the startup script / env. */
+static const char *server_default_model_alias(void) {
+    return "deepseek-v4-flash";
 }
 
-static bool server_model_alias_known(const char *id) {
-    return id &&
-           (!strcmp(id, DS4_PUBLIC_MODEL_ID) ||
-            !strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro") ||
-            !strcmp(id, "deepseek-reasoner"));
+/* Takes the configured id string (not server*) so it can live above the
+ * incomplete server typedef. */
+static const char *server_public_model_id_str(const char *configured) {
+    if (configured && configured[0]) return configured;
+    return server_default_model_alias();
+}
+
+static bool server_model_alias_known_id(const char *public_id, const char *id) {
+    if (!id || !id[0]) return false;
+    if (public_id && public_id[0] && !strcmp(id, public_id)) return true;
+    return !strcmp(id, "deepseek-v4-flash") ||
+           !strcmp(id, "deepseek-v4-pro") ||
+           !strcmp(id, "deepseek-reasoner") ||
+           !strcmp(id, "deepseek-chat");
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -7956,6 +7962,14 @@ struct server {
     int default_tokens;
     int gpu_split_layer;       /* Pipeline split layer (0 = single GPU) */
     uint32_t prefill_chunk;    /* Prefill chunk size used at session create */
+    /* Native Anthropic-facing server policy (replaces Python proxy.py). */
+    char *auth_token;          /* NULL/empty = no auth required */
+    char *public_model_id;     /* Client-facing model id (from env/CLI; not hardcoded) */
+    int thinking_budget_default;  /* Applied when client omits budget; 0 = off */
+    int thinking_budget_max;      /* Hard cap on thinking budget */
+    int auxiliary_budget;         /* Budget for short helper prompts */
+    int max_completion_cap;       /* Soft cap on max_tokens (0 = unlimited) */
+    bool public_model_only;       /* /v1/models lists only public_model_id */
     kv_disk_cache kv;
     tool_memory tool_mem;
     live_tool_state responses_live;
@@ -11592,10 +11606,15 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    /* Optional auth headers (Anthropic x-api-key / OpenAI Bearer). */
+    char *x_api_key;
+    char *authorization;
 } http_request;
 
 static void http_request_free(http_request *r) {
     free(r->body);
+    free(r->x_api_key);
+    free(r->authorization);
     memset(r, 0, sizeof(*r));
 }
 
@@ -11624,6 +11643,46 @@ static long content_length(const char *h, size_t n) {
         if (p < end) p++;
     }
     return 0;
+}
+
+/* Extract a header value into *out (caller frees). Case-insensitive name match. */
+static void http_header_get(const char *h, size_t n, const char *name, char **out) {
+    if (!out) return;
+    free(*out);
+    *out = NULL;
+    size_t namelen = strlen(name);
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > namelen + 1 && strncasecmp(line, name, namelen) == 0 &&
+            line[namelen] == ':') {
+            const char *v = line + namelen + 1;
+            const char *vend = line + len;
+            while (v < vend && isspace((unsigned char)*v)) v++;
+            while (vend > v && isspace((unsigned char)vend[-1])) vend--;
+            size_t vlen = (size_t)(vend - v);
+            *out = xmalloc(vlen + 1);
+            memcpy(*out, v, vlen);
+            (*out)[vlen] = '\0';
+            return;
+        }
+        if (p < end) p++;
+    }
+}
+
+/* Returns true if request is authorized (or no auth configured). */
+static bool http_request_authorized(const http_request *hr, const char *expected) {
+    if (!expected || !expected[0]) return true;  /* auth disabled */
+    if (hr->x_api_key && !strcmp(hr->x_api_key, expected)) return true;
+    if (hr->authorization) {
+        const char *a = hr->authorization;
+        if (!strncmp(a, "Bearer ", 7) && !strcmp(a + 7, expected)) return true;
+        if (!strcmp(a, expected)) return true;
+    }
+    return false;
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -11662,6 +11721,9 @@ static bool read_http_request(int fd, http_request *r) {
         if (n <= 0) goto fail;
         buf_append(&b, tmp, (size_t)n);
     }
+
+    http_header_get(b.ptr, (size_t)hend, "x-api-key", &r->x_api_key);
+    http_header_get(b.ptr, (size_t)hend, "Authorization", &r->authorization);
 
     r->body_len = (size_t)clen;
     r->body = xmalloc(r->body_len + 1);
@@ -11734,18 +11796,110 @@ static bool send_model(server *s, int fd, const char *id) {
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    /* Advertise local-llm as the primary id; keep legacy aliases for
-     * scripts that still send deepseek-v4-flash / deepseek-v4-pro. */
+    /* Public Anthropic clients expect a single configured model id. Legacy
+     * scripts can still address flash/pro aliases when public_model_only=0. */
+    const char *pub = server_public_model_id_str(s->public_model_id);
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, DS4_PUBLIC_MODEL_ID);
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-pro");
+    append_model_json(&b, s, pub);
+    if (!s->public_model_only) {
+        if (strcmp(pub, "deepseek-v4-flash") != 0) {
+            buf_putc(&b, ',');
+            append_model_json(&b, s, "deepseek-v4-flash");
+        }
+        if (strcmp(pub, "deepseek-v4-pro") != 0) {
+            buf_putc(&b, ',');
+            append_model_json(&b, s, "deepseek-v4-pro");
+        }
+    }
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
+}
+
+/* Policy formerly applied by proxy.py: thinking budgets, aux routing, sampling.
+ *
+ * Prior-turn reasoning stripping (proxy strip_prior_reasoning) is already done
+ * in render_chat_prompt_text: without tool context, historical assistant
+ * reasoning is omitted from the prompt so multi-turn agent history does not
+ * balloon. With tools, reasoning is preserved for the tool chain. */
+static void apply_anthropic_server_policy(server *s, request *r, const char *raw_body) {
+    if (!s || !r) return;
+
+    /* Map any client model name to the configured public id in responses. */
+    free(r->model);
+    r->model = xstrdup(server_public_model_id_str(s->public_model_id));
+    r->model_from_request = true;
+
+    /* Detect short helper prompts from last user content in raw JSON (cheap).
+     * Matches proxy AUXILIARY_PATTERNS so title/classify/route helpers skip the
+     * full agent thinking path — a major source of "stuck" feel on trivial turns. */
+    bool auxiliary = false;
+    if (raw_body && s->auxiliary_budget > 0) {
+        static const char *patterns[] = {
+            "\"title\"", "title", "summarize", "summarisation", "summarization",
+            "classification", "classify", "routing", "route",
+            "extract", "extraction", "parse", "parsing",
+            "short answer", "brief", "one line",
+            "yes or no", "yes no", "yes-or-no", NULL
+        };
+        /* Prefer last user message content via body scan. */
+        const char *p = strstr(raw_body, "\"role\"");
+        const char *last_user = NULL;
+        while (p) {
+            const char *role_user = strstr(p, "\"user\"");
+            if (!role_user) break;
+            /* Look for content within ~400 chars after role user */
+            const char *content = strstr(role_user, "\"content\"");
+            if (content && content - role_user < 80) last_user = content;
+            p = role_user + 5;
+        }
+        if (last_user) {
+            for (int i = 0; patterns[i]; i++) {
+                if (strcasestr(last_user, patterns[i])) { auxiliary = true; break; }
+            }
+            /* Very short prompts with simple question stems → aux budget. */
+            if (!auxiliary) {
+                /* Approximate content length from a short window of the JSON. */
+                size_t window = 0;
+                while (last_user[window] && window < 200) window++;
+                if (window < 80) {
+                    static const char *simple[] = {
+                        "what is", "what's", "who is", "define", "explain briefly", NULL
+                    };
+                    for (int i = 0; simple[i]; i++) {
+                        if (strcasestr(last_user, simple[i])) { auxiliary = true; break; }
+                    }
+                }
+            }
+        }
+    }
+
+    int budget = r->thinking_budget_tokens;
+    if (s->thinking_budget_default > 0) {
+        if (budget <= 0) budget = s->thinking_budget_default;
+        if (auxiliary && s->auxiliary_budget > 0) budget = s->auxiliary_budget;
+        if (s->thinking_budget_max > 0 && budget > s->thinking_budget_max)
+            budget = s->thinking_budget_max;
+        /* Leave room for a visible answer inside max_tokens. */
+        if (r->max_tokens > 256 && budget > r->max_tokens - 256)
+            budget = r->max_tokens - 256;
+        if (budget < 64) budget = 64;
+        r->thinking_budget_tokens = budget;
+    }
+
+    /* Soft cap pathological max_tokens that produce finish=length @ 32k and
+     * multi-minute stuck generations (observed 20+ min gen=32000 in logs). */
+    if (s->max_completion_cap > 0 && r->max_tokens > s->max_completion_cap)
+        r->max_tokens = s->max_completion_cap;
+
+    /* Tool requests: greedy structural decoding (DSML safety). Non-tool keeps
+     * client/default sampling. */
+    if (r->has_tools) {
+        r->temperature = 0.0f;
+        r->top_p = 1.0f;
+        r->top_k = 0;
+    }
 }
 
 static void client_done(server *s) {
@@ -11766,6 +11920,13 @@ static void *client_main(void *arg) {
     http_request hr = {0};
     if (!read_http_request(fd, &hr)) {
         http_error(fd, s->enable_cors, 400, "bad HTTP request");
+        goto done;
+    }
+    /* Auth gate (native Anthropic-facing server). OPTIONS remains open for CORS. */
+    if (strcmp(hr.method, "OPTIONS") != 0 &&
+        !http_request_authorized(&hr, s->auth_token)) {
+        http_error(fd, s->enable_cors, 401, "Unauthorized");
+        http_request_free(&hr);
         goto done;
     }
 
@@ -11876,7 +12037,7 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        server_model_alias_known_id(s->public_model_id, hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -11912,6 +12073,7 @@ static void *client_main(void *arg) {
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
+        if (ok) apply_anthropic_server_policy(s, &req, hr.body);
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
@@ -11934,7 +12096,7 @@ static void *client_main(void *arg) {
     }
     if (!req.model_from_request) {
         free(req.model);
-        req.model = xstrdup(server_model_id_from_engine(s->engine));
+        req.model = xstrdup(server_public_model_id_str(s->public_model_id));
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
@@ -12030,6 +12192,14 @@ typedef struct {
     int tool_memory_max_ids;
     int max_queue_depth;       /* 0 = unlimited */
     bool enable_cors;
+    /* Native Anthropic-facing server (replaces Python proxy). */
+    const char *auth_token;    /* from --api-key or DS4_AUTH_TOKEN */
+    const char *public_model_id; /* from --public-model-id or DS4_PUBLIC_MODEL_ID */
+    int thinking_budget_default;
+    int thinking_budget_max;
+    int auxiliary_budget;
+    int max_completion_cap;
+    bool public_model_only;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -12158,6 +12328,9 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    free(s->auth_token);
+    free(s->public_model_id);
+    s->auth_token = NULL;
     ds4_session_free(s->session);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
@@ -12208,8 +12381,27 @@ static server_config parse_options(int argc, char **argv) {
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .max_queue_depth = 0,  /* 0 = unlimited */
+        .auth_token = getenv("DS4_AUTH_TOKEN"),
+        .public_model_id = getenv("DS4_PUBLIC_MODEL_ID"),
+        .thinking_budget_default = 2048,
+        .thinking_budget_max = 4096,
+        .auxiliary_budget = 128,
+        .max_completion_cap = 8192,  /* prevents 32k length-stall stuck gens */
+        .public_model_only = true,
     };
     c.kv_cache = kv_cache_default_options();
+    {
+        const char *tb = getenv("DS4_THINKING_BUDGET");
+        if (tb && tb[0]) c.thinking_budget_default = atoi(tb);
+        const char *ab = getenv("DS4_AUXILIARY_BUDGET");
+        if (ab && ab[0]) c.auxiliary_budget = atoi(ab);
+        const char *mc = getenv("DS4_MAX_COMPLETION_CAP");
+        if (mc && mc[0]) c.max_completion_cap = atoi(mc);
+        const char *pm = getenv("DS4_PUBLIC_MODEL_ONLY");
+        if (pm && pm[0] == '0') c.public_model_only = false;
+        const char *pmid = getenv("DS4_PUBLIC_MODEL_ID");
+        if (pmid && pmid[0]) c.public_model_id = pmid;
+    }
 
     bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
@@ -12259,6 +12451,20 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--api-key")) {
+            c.auth_token = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--thinking-budget")) {
+            c.thinking_budget_default = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--thinking-budget-max")) {
+            c.thinking_budget_max = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--max-completion-cap")) {
+            c.max_completion_cap = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--public-model-id")) {
+            c.public_model_id = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--public-model-only")) {
+            c.public_model_only = true;
+        } else if (!strcmp(arg, "--all-model-aliases")) {
+            c.public_model_only = false;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
@@ -12434,6 +12640,29 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.max_queue_depth = cfg.max_queue_depth;  /* 0 = unlimited */
     s.enable_cors = cfg.enable_cors;
+    s.auth_token = cfg.auth_token ? xstrdup(cfg.auth_token) : NULL;
+    {
+        const char *pmid = (cfg.public_model_id && cfg.public_model_id[0])
+                               ? cfg.public_model_id
+                               : server_default_model_alias();
+        s.public_model_id = xstrdup(pmid);
+    }
+    s.thinking_budget_default = cfg.thinking_budget_default;
+    s.thinking_budget_max = cfg.thinking_budget_max;
+    s.auxiliary_budget = cfg.auxiliary_budget;
+    s.max_completion_cap = cfg.max_completion_cap;
+    s.public_model_only = cfg.public_model_only;
+    if (s.auth_token && s.auth_token[0]) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: API auth enabled (x-api-key / Bearer); native Anthropic on /v1/messages");
+    }
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: public_model_id=%s public_model_only=%d "
+               "thinking_budget_default=%d max=%d aux=%d max_completion_cap=%d",
+               s.public_model_id ? s.public_model_id : "(null)",
+               s.public_model_only ? 1 : 0,
+               s.thinking_budget_default, s.thinking_budget_max, s.auxiliary_budget,
+               s.max_completion_cap);
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
